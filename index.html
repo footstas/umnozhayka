@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Космическая стрелялка: умножение на 2 и 3 — уровни</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { overflow: hidden; background: #0b0d2a; font-family: 'Comic Sans MS', Arial, sans-serif; user-select: none; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+// ================= ХОЛСТ =================
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let W, H;
+function resize() { W = canvas.width = window.innerWidth; H = canvas.height = window.innerHeight; }
+window.addEventListener('resize', resize); resize();
+
+// ================= ЗВУКИ =================
+let audioCtx = null;
+function beep(freq, dur, type, vol) {
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = type || 'sine'; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol || 0.15, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime + dur);
+  } catch (e) {}
+}
+const soundShoot = () => beep(880, .08, 'square', .06);
+const soundGood  = () => { beep(660, .1); setTimeout(() => beep(880, .15), 100); };
+const soundBad   = () => beep(160, .35, 'sawtooth');
+const soundWin   = () => [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => beep(f, .25), i * 150));
+const soundClick = () => beep(520, .07);
+
+// ================= УРОВНИ =================
+// count — сколько уникальных примеров в уровне (не больше пула a × b)
+const LEVELS = [
+  { title: 'Уровень 1', name: 'Учим ×2',        desc: 'Умножение на 2, числа от 1 до 5', mults: [2],    max: 5, count: 5, pass: 4 },
+  { title: 'Уровень 2', name: '×2: вся таблица', desc: 'Умножение на 2, числа от 1 до 9', mults: [2],    max: 9, count: 8, pass: 5 },
+  { title: 'Уровень 3', name: 'Учим ×3',        desc: 'Умножение на 3, числа от 1 до 5', mults: [3],    max: 5, count: 5, pass: 4 },
+  { title: 'Уровень 4', name: '×3: вся таблица', desc: 'Умножение на 3, числа от 1 до 9', mults: [3],    max: 9, count: 8, pass: 5 },
+  { title: 'Уровень 5', name: 'Микс! 🔥',        desc: 'Всё вместе: ×2 и ×3, числа 1–9',  mults: [2, 3], max: 9, count: 8, pass: 5 },
+];
+
+// прогресс сохраняется в браузере между запусками
+const SAVE_KEY = 'cosmoShooterProgress';
+let progress = { unlocked: 1, stars: LEVELS.map(() => 0) };
+try {
+  const saved = JSON.parse(localStorage.getItem(SAVE_KEY));
+  if (saved && saved.unlocked) progress = saved;
+} catch (e) {}
+function saveProgress() { try { localStorage.setItem(SAVE_KEY, JSON.stringify(progress)); } catch (e) {} }
+
+// ================= СОСТОЯНИЕ =================
+let state = 'menu';   // menu | intro | play | pause | levelEnd
+let levelIdx = 0;
+let questions = [], qi = 0, score = 0, streak = 0;
+let pauseTimer = 0, introTimer = 0, revealCorrect = false;
+let flash = null, bullets = [], parts = [], confs = [];
+let buttons = [];
+let hoverBtn = null;
+
+const rocket = { x: 0, y: 0, w: 60, h: 70, speed: 7, flame: 0 };
+const keys = {};
+let targets = [];
+
+const stars = [];
+for (let i = 0; i < 80; i++) stars.push({
+  x: Math.random(), y: Math.random(), r: Math.random() * 1.5 + .5, tw: Math.random() * 7
+});
+
+function rand(a, b) { return a + Math.random() * (b - a); }
+function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+function shuffle(arr) { for (let i = arr.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [arr[i], arr[j]] = [arr[j], arr[i]]; } return arr; }
+
+// ================= ВОПРОСЫ (без повторов) =================
+function buildQuestions(lv) {
+  // собираем ВСЕ возможные пары (a, b) и перемешиваем — повторов не будет
+  const pairs = [];
+  for (let a = 1; a <= lv.max; a++) for (const b of lv.mults) pairs.push([a, b]);
+  shuffle(pairs);
+  const chosen = pairs.slice(0, Math.min(lv.count, pairs.length));
+  return chosen.map(([a, b]) => {
+    const answer = a * b;
+    const wrongs = new Set();
+    while (wrongs.size < 2) {
+      const w = answer + (Math.floor(Math.random() * 7) + 2) * (Math.random() < .5 ? -1 : 1);
+      if (w > 0 && w !== answer) wrongs.add(w);
+    }
+    return { text: a + ' × ' + b, answer, options: [answer, ...wrongs].sort(() => Math.random() - .5) };
+  });
+}
+
+function spawnTargets(q) {
+  targets = q.options.map((val, i) => ({
+    val, correct: val === q.answer,
+    x: W * (0.2 + i * 0.3) + rand(-40, 40),
+    y: rand(130, H * 0.45),
+    vx: rand(-0.8, 0.8) || 0.6,
+    vy: rand(-0.3, 0.3),
+    r: 44, wob: Math.random() * 7, hit: false, dim: false
+  }));
+}
+
+function startLevel(idx) {
+  levelIdx = idx;
+  const lv = LEVELS[idx];
+  questions = buildQuestions(lv);
+  qi = 0; score = 0; streak = 0;
+  bullets = []; parts = []; confs = []; revealCorrect = false;
+  rocket.x = W / 2; rocket.y = H - 90; rocket.targetX = null;
+  state = 'intro'; introTimer = 110;
+}
+
+function nextQuestion() {
+  spawnTargets(questions[qi]);
+  flash = { text: 'Пример ' + (qi + 1) + ' из ' + LEVELS[levelIdx].count, color: '#ffe66d', life: 70 };
+}
+
+// ================= ЭФФЕКТЫ =================
+function boom(x, y, color, n) {
+  for (let i = 0; i < n; i++) parts.push({
+    x, y, vx: rand(-4, 4), vy: rand(-5, 2), r: rand(2, 5), life: rand(30, 60), color
+  });
+}
+function confetti(n) {
+  const colors = ['#ff6b6b', '#ffd700', '#4ecdc4', '#a29bfe', '#6ee86e'];
+  for (let i = 0; i < n; i++) confs.push({
+    x: rand(0, W), y: rand(-60, -10), vy: rand(2, 5), vx: rand(-1.5, 1.5),
+    size: rand(6, 11), color: pick(colors), rot: rand(0, 6.28), vr: rand(-.2, .2)
+  });
+}
+
+function answer(t) {
+  t.hit = true;
+  const lv = LEVELS[levelIdx];
+  if (t.correct) {
+    score++; streak++;
+    soundGood(); boom(t.x, t.y, '#ffd700', 40);
+    flash = { text: pick(['Попадание! 🚀', 'Точно в цель! 🎯', 'Супер! ⭐']), color: '#6ee86e', life: 80 };
+    if (streak % 5 === 0) flash = { text: '🔥 СЕРИЯ ' + streak + '! 🔥', color: '#ff9f43', life: 110 };
+    confetti(25);
+    qi++; state = 'pause'; pauseTimer = 60; revealCorrect = false;
+  } else {
+    streak = 0;
+    soundBad(); boom(t.x, t.y, '#ff5252', 25);
+    flash = { text: 'Мимо! ' + t.val + ' — не то. Смотри, где правильный 💡', color: '#ff8a8a', life: 130 };
+    revealCorrect = true;
+    targets.forEach(o => { if (o.correct) o.glow = 1; else o.dim = true; });
+    qi++; state = 'pause'; pauseTimer = 150;
+  }
+}
+
+// ================= ВВОД =================
+addEventListener('keydown', e => {
+  if (['ArrowLeft', 'ArrowRight', ' '].includes(e.key)) e.preventDefault();
+  keys[e.key] = true;
+  if (e.key === ' ' && state === 'play' && bullets.length < 2) shoot();
+  if (e.key === 'Escape' && (state === 'play' || state === 'pause')) state = 'menu';
+});
+addEventListener('keyup', e => keys[e.key] = false);
+
+canvas.addEventListener('pointerdown', e => {
+  const x = e.clientX, y = e.clientY;
+  for (const b of buttons) {
+    if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) { soundClick(); b.action(); return; }
+  }
+  if (state === 'play') { rocket.targetX = e.clientX; shoot(); }
+});
+canvas.addEventListener('pointermove', e => {
+  hoverBtn = null;
+  for (const b of buttons) {
+    if (e.clientX >= b.x && e.clientX <= b.x + b.w && e.clientY >= b.y && e.clientY <= b.y + b.h) hoverBtn = b;
+  }
+  if (state === 'play') rocket.targetX = e.clientX;
+});
+
+function shoot() {
+  bullets.push({ x: rocket.x, y: rocket.y - rocket.h, vy: -11 });
+  soundShoot();
+}
+
+// ================= ОБНОВЛЕНИЕ =================
+function update() {
+  stars.forEach(s => s.tw += .05);
+  parts.forEach(p => { p.x += p.vx; p.y += p.vy; p.vy += .08; p.life--; });
+  parts = parts.filter(p => p.life > 0);
+  confs.forEach(c => { c.x += c.vx; c.y += c.vy; c.rot += c.vr; });
+  confs = confs.filter(c => c.y < H + 20);
+  if (flash) { flash.life--; if (flash.life <= 0) flash = null; }
+
+  if (state === 'intro') {
+    introTimer--;
+    if (introTimer <= 0) { state = 'play'; nextQuestion(); }
+  }
+
+  if (state === 'play') {
+    if (keys['ArrowLeft'] || keys['a'] || keys['ф']) rocket.x -= rocket.speed;
+    if (keys['ArrowRight'] || keys['d'] || keys['в']) rocket.x += rocket.speed;
+    if (rocket.targetX != null) {
+      const d = rocket.targetX - rocket.x;
+      rocket.x += Math.min(Math.abs(d), rocket.speed + 3) * Math.sign(d);
+    }
+    rocket.x = Math.max(rocket.w / 2 + 10, Math.min(W - rocket.w / 2 - 10, rocket.x));
+    rocket.flame = 0.8 + Math.sin(Date.now() / 60) * 0.35;
+
+    targets.forEach(t => {
+      if (t.hit) return;
+      t.x += t.vx; t.y += t.vy; t.wob += .04;
+      if (t.x < 60 || t.x > W - 60) t.vx *= -1;
+      if (t.y < 100 || t.y > H * 0.55) t.vy *= -1;
+      if (t.glow) t.glow = (t.glow + .05) % 2;
+    });
+
+    bullets.forEach(b => b.y += b.vy);
+    bullets = bullets.filter(b => {
+      if (b.y < -20) return false;
+      for (const t of targets) {
+        if (t.hit) continue;
+        if (Math.hypot(b.x - t.x, b.y - t.y) < t.r + 6) { answer(t); return false; }
+      }
+      return true;
+    });
+  }
+
+  if (state === 'pause') {
+    pauseTimer--;
+    targets.forEach(t => { t.x += t.vx * .3; t.wob += .02; if (t.glow) t.glow = (t.glow + .05) % 2; });
+    if (pauseTimer <= 0) {
+      revealCorrect = false;
+      if (qi >= LEVELS[levelIdx].count) endLevel();
+      else { state = 'play'; nextQuestion(); }
+    }
+  }
+}
+
+function endLevel() {
+  const lv = LEVELS[levelIdx];
+  const passed = score >= lv.pass;
+  const starsEarned = score === lv.count ? 3 : score > lv.pass ? 2 : score >= lv.pass ? 1 : 0;
+  if (passed && starsEarned > progress.stars[levelIdx]) progress.stars[levelIdx] = starsEarned;
+  const unlockedNext = passed && levelIdx + 1 < LEVELS.length && progress.unlocked < levelIdx + 2;
+  if (unlockedNext) progress.unlocked = levelIdx + 2;
+  saveProgress();
+  state = 'levelEnd';
+  if (passed) { soundWin(); confetti(90); } else soundBad();
+}
+
+// ================= РИСОВАНИЕ =================
+function roundRect(x, y, w, h, r) { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); }
+
+function drawButton(b) {
+  const hov = b === hoverBtn && !b.locked;
+  ctx.save();
+  ctx.globalAlpha = b.locked ? 0.45 : 1;
+  ctx.fillStyle = b.locked ? '#444a5a' : (b.color || '#4ecdc4');
+  roundRect(b.x, b.y, b.w, b.h, 16); ctx.fill();
+  if (hov) { ctx.strokeStyle = '#ffe66d'; ctx.lineWidth = 4; roundRect(b.x, b.y, b.w, b.h, 16); ctx.stroke(); }
+  ctx.fillStyle = b.locked ? '#999' : '#fff';
+  ctx.font = (b.font || 'bold 24px') + ' "Comic Sans MS", Arial';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2);
+  if (b.sub) {
+    ctx.fillStyle = b.locked ? '#999' : '#eafffe';
+    ctx.font = '17px "Comic Sans MS", Arial';
+    ctx.fillText(b.sub, b.x + b.w / 2, b.y + b.h / 2 + 26);
+  }
+  if (b.stars !== undefined) {
+    let s = '';
+    for (let i = 0; i < 3; i++) s += i < b.stars ? '⭐' : '☆';
+    ctx.fillStyle = '#ffe66d'; ctx.font = '20px Arial';
+    ctx.fillText(s, b.x + b.w / 2, b.y + b.h / 2 + 54);
+  }
+  ctx.restore();
+}
+
+function centerText(text, y, size, color, bold) {
+  ctx.fillStyle = color;
+  ctx.font = (bold ? 'bold ' : '') + size + 'px "Comic Sans MS", Arial';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(text, W / 2, y);
+}
+
+function draw() {
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, '#0b0d2a'); grad.addColorStop(.6, '#1b1f4b'); grad.addColorStop(1, '#2d1b4e');
+  ctx.fillStyle = grad; ctx.fillRect(0, 0, W, H);
+
+  stars.forEach(s => {
+    ctx.globalAlpha = .4 + Math.abs(Math.sin(s.tw)) * .6;
+    ctx.fillStyle = '#fff';
+    ctx.beginPath(); ctx.arc(s.x * W, s.y * H, s.r, 0, 7); ctx.fill();
+  });
+  ctx.globalAlpha = 1;
+
+  parts.forEach(p => {
+    ctx.globalAlpha = Math.max(p.life / 60, 0);
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 7); ctx.fill();
+  });
+  ctx.globalAlpha = 1;
+  confs.forEach(c => {
+    ctx.save(); ctx.translate(c.x, c.y); ctx.rotate(c.rot);
+    ctx.fillStyle = c.color; ctx.fillRect(-c.size/2, -c.size/4, c.size, c.size/2);
+    ctx.restore();
+  });
+
+  buttons = [];
+
+  if (state === 'menu') {
+    centerText('🚀 КОСМИЧЕСКИЙ УМНОЖАЙКА', H * 0.12, 42, '#ffe66d', true);
+    centerText('Выбери уровень', H * 0.19, 24, '#ffffffcc', false);
+    const bw = Math.min(360, W - 60), bh = 92, gap = 18;
+    const totalH = LEVELS.length * bh + (LEVELS.length - 1) * gap;
+    let y = H / 2 - totalH / 2 + 10;
+    LEVELS.forEach((lv, i) => {
+      const locked = i + 1 > progress.unlocked;
+      const b = {
+        x: W / 2 - bw / 2, y, w: bw, h: bh,
+        label: locked ? '🔒 ' + lv.title : lv.title + ' · ' + lv.name,
+        sub: locked ? 'Пройди предыдущий уровень' : lv.desc,
+        stars: locked ? undefined : progress.stars[i],
+        locked,
+        color: ['#4ecdc4', '#5fa8ff', '#a29bfe', '#ff9f43', '#ff6b6b'][i],
+        action: () => { if (!locked) startLevel(i); }
+      };
+      buttons.push(b); drawButton(b);
+      y += bh + gap;
+    });
+    centerText('ESC во время игры — вернуться в меню', H - 24, 17, '#ffffff77', false);
+  }
+
+  if (state === 'intro') {
+    const lv = LEVELS[levelIdx];
+    ctx.globalAlpha = Math.min(introTimer / 20, 1, (110 - introTimer) / 15 + 1);
+    centerText(lv.title, H / 2 - 90, 34, '#ffe66d', true);
+    centerText(lv.name, H / 2 - 20, 52, '#fff', true);
+    centerText(lv.desc, H / 2 + 45, 24, '#a9c4ff', false);
+    centerText(lv.count + ' примеров без повторов · нужно ' + lv.pass + ' правильных, чтобы открыть следующий', H / 2 + 90, 20, '#ffffffaa', false);
+    ctx.globalAlpha = 1;
+  }
+
+  if (state === 'play' || state === 'pause') {
+    const lv = LEVELS[levelIdx];
+    const q = questions[qi];
+    if (q) {
+      const boxW = 320, boxH = 78;
+      ctx.fillStyle = '#00000055';
+      roundRect(W/2 - boxW/2, 18, boxW, boxH, 18); ctx.fill();
+      ctx.strokeStyle = '#ffe66d'; ctx.lineWidth = 3;
+      roundRect(W/2 - boxW/2, 18, boxW, boxH, 18); ctx.stroke();
+      ctx.fillStyle = '#ffe66d';
+      ctx.font = 'bold 44px "Comic Sans MS", Arial';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(q.text + ' = ?', W/2, 18 + boxH/2);
+    }
+    ctx.font = 'bold 22px "Comic Sans MS", Arial';
+    ctx.fillStyle = '#ffd700'; ctx.textAlign = 'left';
+    ctx.fillText('Счёт: ' + score + ' / ' + lv.count, 20, 34);
+    ctx.fillStyle = '#a9c4ff';
+    ctx.fillText(lv.title, 20, 62);
+    if (streak >= 3) {
+      ctx.fillStyle = '#ff9f43'; ctx.textAlign = 'right';
+      ctx.fillText('🔥 Серия: ' + streak, W - 20, 34);
+    }
+
+    targets.forEach(t => {
+      if (t.hit) return;
+      const yy = t.y + Math.sin(t.wob) * 6;
+      if (revealCorrect && t.glow && Math.sin(t.glow * Math.PI) > .3) {
+        ctx.save(); ctx.shadowColor = '#6ee86e'; ctx.shadowBlur = 30;
+      }
+      ctx.beginPath();
+      for (let i = 0; i < 9; i++) {
+        const ang = i / 9 * Math.PI * 2;
+        const rr = t.r * (0.85 + 0.13 * Math.sin(i * 2.7 + t.wob));
+        const px = t.x + Math.cos(ang) * rr, py = yy + Math.sin(ang) * rr;
+        i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+      }
+      ctx.closePath();
+      ctx.fillStyle = t.dim ? '#3a3a4a' : (revealCorrect && t.correct ? '#2e7d4f' : '#6b5b4a');
+      ctx.fill();
+      ctx.strokeStyle = t.dim ? '#555' : '#8a7a68'; ctx.lineWidth = 3; ctx.stroke();
+      ctx.restore();
+      ctx.fillStyle = t.dim ? '#777' : '#fff';
+      ctx.font = 'bold 36px "Comic Sans MS", Arial';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(t.val, t.x, yy);
+    });
+
+    const rx = rocket.x, ry = rocket.y;
+    ctx.save();
+    ctx.fillStyle = '#ff9f43';
+    ctx.beginPath();
+    ctx.moveTo(rx - 10, ry + 28);
+    ctx.quadraticCurveTo(rx, ry + 28 + 26 * rocket.flame + Math.random() * 6, rx + 10, ry + 28);
+    ctx.fill();
+    ctx.fillStyle = '#ffd700';
+    ctx.beginPath();
+    ctx.moveTo(rx - 5, ry + 28);
+    ctx.quadraticCurveTo(rx, ry + 28 + 14 * rocket.flame, rx + 5, ry + 28);
+    ctx.fill();
+    ctx.restore();
+    ctx.fillStyle = '#e8e8f0';
+    ctx.beginPath();
+    ctx.moveTo(rx, ry - rocket.h);
+    ctx.quadraticCurveTo(rx + 24, ry - 10, rx + 20, ry + 20);
+    ctx.lineTo(rx - 20, ry + 20);
+    ctx.quadraticCurveTo(rx - 24, ry - 10, rx, ry - rocket.h);
+    ctx.fill();
+    ctx.fillStyle = '#4ecdc4';
+    ctx.beginPath(); ctx.arc(rx, ry - 24, 9, 0, 7); ctx.fill();
+    ctx.fillStyle = '#ff6b6b';
+    ctx.beginPath(); ctx.moveTo(rx - 20, ry + 10); ctx.lineTo(rx - 34, ry + 30); ctx.lineTo(rx - 20, ry + 24); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(rx + 20, ry + 10); ctx.lineTo(rx + 34, ry + 30); ctx.lineTo(rx + 20, ry + 24); ctx.fill();
+
+    bullets.forEach(b => {
+      ctx.fillStyle = '#ffe66d';
+      ctx.shadowColor = '#ffd700'; ctx.shadowBlur = 12;
+      ctx.beginPath(); ctx.arc(b.x, b.y, 5, 0, 7); ctx.fill();
+      ctx.shadowBlur = 0;
+    });
+  }
+
+  if (state === 'play' && qi === 0 && score === 0) {
+    ctx.font = '20px "Comic Sans MS", Arial';
+    ctx.fillStyle = '#ffffff99'; ctx.textAlign = 'center';
+    ctx.fillText('← → двигай ракету, ПРОБЕЛ — выстрел 🚀', W/2, H - 20);
+  }
+
+  if (flash) {
+    ctx.globalAlpha = Math.min(flash.life / 30, 1);
+    ctx.font = 'bold 34px "Comic Sans MS", Arial';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillStyle = flash.color;
+    ctx.shadowColor = '#000'; ctx.shadowBlur = 8;
+    ctx.fillText(flash.text, W/2, H * 0.62);
+    ctx.shadowBlur = 0;
+    ctx.globalAlpha = 1;
+  }
+
+  if (state === 'levelEnd') {
+    ctx.fillStyle = '#000000aa'; ctx.fillRect(0, 0, W, H);
+    const lv = LEVELS[levelIdx];
+    const passed = score >= lv.pass;
+    centerText(passed ? '🎉 УРОВЕНЬ ПРОЙДЕН!' : '💪 НЕДОСТАТОЧНО ПОПАДАНИЙ', H/2 - 130, 44, passed ? '#ffe66d' : '#ff8a8a', true);
+    centerText('Правильных ответов: ' + score + ' из ' + lv.count, H/2 - 60, 28, '#fff', false);
+    const starsEarned = score === lv.count ? 3 : score > lv.pass ? 2 : score >= lv.pass ? 1 : 0;
+    let s = '';
+    for (let i = 0; i < 3; i++) s += i < starsEarned ? '⭐' : '☆';
+    centerText(s, H/2, 40, '#ffe66d', false);
+    if (!passed) centerText('Нужно хотя бы ' + lv.pass + ' правильных, чтобы открыть следующий уровень', H/2 + 45, 20, '#ffffffaa', false);
+
+    // КНОПКИ — широкие промежутки между ними
+    const bw = 250, bh = 62, by = H/2 + 120;
+    const has3 = passed && levelIdx + 1 < LEVELS.length;
+    const gap = Math.max(40, Math.min(90, (W - (has3 ? 3 : 2) * bw - 60) / 2));
+    const total = (has3 ? 3 : 2) * bw + (has3 ? 2 : 1) * gap;
+    let bx = W/2 - total/2;
+
+    if (has3) {
+      const next = { x: bx, y: by, w: bw, h: bh, label: 'Уровень ' + (levelIdx + 2) + ' ▶', color: '#6ee86e', action: () => startLevel(levelIdx + 1) };
+      buttons.push(next); drawButton(next);
+      bx += bw + gap;
+    }
+    const retry = { x: bx, y: by, w: bw, h: bh, label: 'Ещё раз 🔁', color: '#4ecdc4', action: () => startLevel(levelIdx) };
+    buttons.push(retry); drawButton(retry);
+    bx += bw + gap;
+    const menu = { x: bx, y: by, w: bw, h: bh, label: 'Меню 🏠', color: '#a29bfe', action: () => { state = 'menu'; } };
+    buttons.push(menu); drawButton(menu);
+  }
+}
+
+// ================= ЦИКЛ =================
+function loop() { update(); draw(); requestAnimationFrame(loop); }
+loop();
+</script>
+</body>
+</html>
